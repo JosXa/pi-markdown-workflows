@@ -1,23 +1,24 @@
 import type { ExtensionCommandContext } from "@mariozechner/pi-coding-agent";
 
-import { createAction } from "../../../sdk/action.js";
-import { create } from "../../../sdk/template.js";
-import { createList } from "../../../sdk/list.js";
-import { detailScroll, detailToggle } from "../../../sdk/keybind-logic.js";
 import {
   about,
   back,
   backtab,
+  create,
+  createAction,
+  createList,
+  detailScroll,
+  detailToggle,
   down,
   enter,
   esc,
   help,
+  renderDetail,
   slash,
   tab,
   text,
   up,
-} from "../../../sdk/keybinds.js";
-import { renderDetail } from "../../../sdk/detail-frame.js";
+} from "@howaboua/pi-howaboua-extensions-primitives-sdk";
 import type { SkillDefinition, WorkflowDefinition, WorkflowPick } from "../../types/index.js";
 import {
   aboutView,

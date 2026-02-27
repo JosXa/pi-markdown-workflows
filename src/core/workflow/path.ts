@@ -1,4 +1,5 @@
 import type { WorkflowDefinition } from "../../types/index.js";
+import { parseNameDescriptionFrontmatter } from "../frontmatter.js";
 
 export const PRIMARY_WORKFLOWS_DIR = [".pi", "workflows"];
 export const PRIMARY_WORKFLOW_FILE = "SKILL.md";
@@ -24,13 +25,7 @@ export function stripFrontmatter(body: string): string {
 export function parseWorkflowFrontmatter(
   content: string,
 ): Omit<WorkflowDefinition, "location"> | null {
-  const frontmatterMatch = content.match(/^---\n([\s\S]+?)\n---/);
-  if (!frontmatterMatch) return null;
-  const frontmatter = frontmatterMatch[1] ?? "";
-  const nameMatch = frontmatter.match(/name:\s*(.+)/);
-  const descriptionMatch = frontmatter.match(/description:\s*(.+)/);
-  const name = nameMatch?.[1]?.trim();
-  const description = descriptionMatch?.[1]?.trim();
-  if (!name || !description) return null;
-  return { name, description };
+  const parsed = parseNameDescriptionFrontmatter(content);
+  if (!parsed) return null;
+  return parsed;
 }

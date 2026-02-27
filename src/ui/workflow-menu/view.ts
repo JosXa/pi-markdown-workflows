@@ -1,9 +1,12 @@
 import { spawn } from "node:child_process";
 import fs from "node:fs";
 
-import { createDetail } from "../../../sdk/detail.js";
-import { createList, type Col } from "../../../sdk/list.js";
-import { row } from "../../../sdk/template.js";
+import {
+  createDetail,
+  createList,
+  row,
+  type Col,
+} from "@howaboua/pi-howaboua-extensions-primitives-sdk";
 import { stripFrontmatter } from "../../core/workflow.js";
 import type {
   SkillAction,

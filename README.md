@@ -15,6 +15,13 @@ A single interface powers both `/workflows` and `/skills`.
 - Search, preview details, and run actions from the same UX model
 - Keep command surface clean while still supporting advanced actions
 
+### UI primitives SDK (npm)
+This extension now consumes UI primitives from npm via:
+
+- `@howaboua/pi-howaboua-extensions-primitives-sdk`
+
+The SDK is no longer vendored in this repository under `sdk/`.
+
 ### Three user commands
 This extension exposes three user-facing commands:
 

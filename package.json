@@ -26,6 +26,7 @@
     "prepublishOnly": "npm run build"
   },
   "dependencies": {
+    "@howaboua/pi-howaboua-extensions-primitives-sdk": "^0.0.1",
     "@sinclair/typebox": "^0.34.41"
   },
   "devDependencies": {

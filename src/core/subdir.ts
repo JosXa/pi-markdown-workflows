@@ -3,8 +3,9 @@ import os from "node:os";
 import path from "node:path";
 
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
-import type { TextContent } from "../types/index.js";
 import { normalizeAtPrefix } from "./workflow.js";
+
+const SUBDIR_CONTEXT_MESSAGE_TYPE = "subdir-context-autoload";
 
 function resolvePath(targetPath: string, baseDir: string): string {
   const cleaned = normalizeAtPrefix(targetPath);
@@ -66,6 +67,7 @@ function bashTargets(value: string, base: string): string[] {
 
 export function registerSubdirContextAutoload(pi: ExtensionAPI): void {
   const loadedAgents = new Set<string>();
+  const loadedAgentsContent = new Map<string, string>();
   let currentCwd = "";
   let cwdAgentsPath = "";
   let homeDir = "";
@@ -77,6 +79,7 @@ export function registerSubdirContextAutoload(pi: ExtensionAPI): void {
     homeDir = resolvePath(os.homedir(), process.cwd());
     readCount = 0;
     loadedAgents.clear();
+    loadedAgentsContent.clear();
     loadedAgents.add(cwdAgentsPath);
   }
 
@@ -93,6 +96,37 @@ export function registerSubdirContextAutoload(pi: ExtensionAPI): void {
       dir = parent;
     }
     return agentsFiles.reverse();
+  }
+
+  function relativePath(absolutePath: string): string {
+    const relative = currentCwd ? path.relative(currentCwd, absolutePath) : absolutePath;
+    return (relative || absolutePath).replaceAll("\\", "/");
+  }
+
+  function buildInjectedContextMessage() {
+    if (!loadedAgentsContent.size) return null;
+    const files = [...loadedAgentsContent.entries()].sort(([a], [b]) => a.localeCompare(b));
+    const body = files
+      .map(([agentsPath, content]) => {
+        const rel = relativePath(agentsPath);
+        return `<agents_file path="${rel}">\n${content}\n</agents_file>`;
+      })
+      .join("\n\n");
+    return {
+      role: "custom" as const,
+      customType: SUBDIR_CONTEXT_MESSAGE_TYPE,
+      content: [
+        "<subdirectory_agents_context>",
+        "Automatically loaded AGENTS.md context relevant to recently accessed files.",
+        body,
+        "</subdirectory_agents_context>",
+      ].join("\n"),
+      display: false,
+      details: {
+        files: files.map(([agentsPath]) => relativePath(agentsPath)),
+      },
+      timestamp: Date.now(),
+    };
   }
 
   const handleSessionChange = (_event: unknown, ctx: ExtensionContext): void => {
@@ -151,23 +185,45 @@ export function registerSubdirContextAutoload(pi: ExtensionAPI): void {
     const shouldRefresh = readCount % 10 === 0;
     if (!hasFresh && !shouldRefresh) return undefined;
 
-    const additions: TextContent[] = [];
+    const loadedNow: string[] = [];
 
     for (const agentsPath of agentFiles) {
       try {
         const content = await fs.promises.readFile(agentsPath, "utf-8");
+        const wasLoaded = loadedAgents.has(agentsPath);
         loadedAgents.add(agentsPath);
-        additions.push({
-          type: "text",
-          text: `Loaded subdirectory context from ${agentsPath}\n\n${content}`,
-        });
+        loadedAgentsContent.set(agentsPath, content);
+        if (!wasLoaded) loadedNow.push(relativePath(agentsPath));
       } catch (error) {
         if (ctx.hasUI) ctx.ui.notify(`Failed to load ${agentsPath}: ${String(error)}`, "warning");
       }
     }
 
-    if (!additions.length) return undefined;
-    const baseContent = event.content ?? [];
-    return { content: [...baseContent, ...additions], details: event.details };
+    if (loadedNow.length && ctx.hasUI) {
+      const label =
+        loadedNow.length === 1
+          ? `Loaded AGENTS.md context: ${loadedNow[0]}`
+          : `Loaded AGENTS.md context (${loadedNow.length} files)`;
+      ctx.ui.notify(label, "info");
+    }
+
+    return undefined;
+  });
+
+  pi.on("context", async (event) => {
+    const injected = buildInjectedContextMessage();
+    if (!injected) return undefined;
+    const baseMessages = Array.isArray(event.messages) ? event.messages : [];
+    const messages = baseMessages.filter((message) => {
+      return !(
+        message &&
+        typeof message === "object" &&
+        "role" in message &&
+        message.role === "custom" &&
+        "customType" in message &&
+        message.customType === SUBDIR_CONTEXT_MESSAGE_TYPE
+      );
+    });
+    return { messages: [...messages, injected] };
   });
 }

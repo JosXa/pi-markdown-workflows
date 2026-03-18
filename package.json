@@ -32,7 +32,7 @@
     "@sinclair/typebox": "^0.34.41"
   },
   "devDependencies": {
-    "@mariozechner/pi-coding-agent": "*",
+    "@mariozechner/pi-coding-agent": "^0.58.3",
     "@types/node": "^24.3.0",
     "oxfmt": "^0.35.0",
     "typescript": "^5.9.3"

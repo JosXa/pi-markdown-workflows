@@ -3,10 +3,43 @@ import os from "node:os";
 import path from "node:path";
 
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
+import { Text } from "@mariozechner/pi-tui";
 import { normalizeAtPrefix } from "./workflow.js";
 
 const SUBDIR_CONTEXT_MESSAGE_TYPE = "subdir-context-autoload";
+const SUBDIR_CONTEXT_NOTIFY_TYPE = "subdir-context-notify";
+
 const SUBDIR_CONTEXT_DETAILS_KEY = "subdirContextAutoload";
+
+const DEFAULT_RECENCY_WINDOW = 10;
+
+interface SubdirConfig {
+  dotagentsRecency?: number;
+}
+
+function loadConfig(): SubdirConfig {
+  const configPath = path.join(os.homedir(), ".pi", "agent", "extensions", "pi-markdown-workflows", "config.json");
+  try {
+    const raw = fs.readFileSync(configPath, "utf-8");
+    return JSON.parse(raw) as SubdirConfig;
+  } catch {
+    return {};
+  }
+}
+
+function getRecencyWindow(pi: ExtensionAPI): number {
+  // CLI flag takes precedence over config file
+  const flagValue = pi.getFlag("--dotagents-recency");
+  if (flagValue !== undefined && flagValue !== "10") {
+    const parsed = parseInt(String(flagValue), 10);
+    if (!isNaN(parsed) && parsed >= 1) return parsed;
+  }
+  const config = loadConfig();
+  if (config.dotagentsRecency !== undefined && config.dotagentsRecency >= 1) {
+    return config.dotagentsRecency;
+  }
+  return DEFAULT_RECENCY_WINDOW;
+}
 
 type PersistedContextFile = { path: string; content: string };
 
@@ -104,6 +137,29 @@ function mergePersistedContextDetails(
 }
 
 export function registerSubdirContextAutoload(pi: ExtensionAPI): void {
+  pi.registerFlag("dotagents-recency", {
+    description: "Number of recent messages to keep AGENTS.md context within (default: 10)",
+    type: "string",
+    default: "10",
+  });
+
+  // Renderer for the context injection message (shown inline in conversation)
+  pi.registerMessageRenderer(SUBDIR_CONTEXT_MESSAGE_TYPE, (message, _options, theme) => {
+    const details = message.details as { files?: string[] } | undefined;
+    const files = details?.files ?? [];
+    const lines = files.map((f) => theme.fg("dim", `↳ Loaded ${f}`));
+    return new Text(lines.join("\n"), 0, 0);
+  });
+
+  // Renderer for the re-injection notification
+  pi.registerMessageRenderer(SUBDIR_CONTEXT_NOTIFY_TYPE, (message, _options, theme) => {
+    const details = message.details as { files?: string[] } | undefined;
+    const files = details?.files ?? [];
+    const verb = typeof message.content === "string" && message.content.startsWith("Loaded") ? "Loaded" : "Refreshed";
+    const lines = files.map((f) => theme.fg("dim", `↳ ${verb} ${f}`));
+    return new Text(lines.join("\n"), 0, 0);
+  });
+
   const loadedAgents = new Set<string>();
   const loadedAgentsContent = new Map<string, string>();
   let currentCwd = "";
@@ -202,6 +258,29 @@ export function registerSubdirContextAutoload(pi: ExtensionAPI): void {
     };
   }
 
+  function countAssistantMessagesSinceLastInjection(ctx: ExtensionContext): number | null {
+    const branch = ctx.sessionManager.getBranch();
+    let assistantCount = 0;
+    // Walk backwards from the end of the branch
+    for (let i = branch.length - 1; i >= 0; i--) {
+      const entry = branch[i];
+      if (!entry || typeof entry !== "object" || entry.type !== "message") continue;
+      const message = (entry as { message?: unknown }).message;
+      if (!message || typeof message !== "object" || Array.isArray(message)) continue;
+      const role = (message as { role?: unknown }).role;
+      const customType = (message as { customType?: unknown }).customType;
+      // Found our injection message — return the count
+      if (role === "custom" && customType === SUBDIR_CONTEXT_MESSAGE_TYPE) {
+        return assistantCount;
+      }
+      if (role === "assistant") {
+        assistantCount++;
+      }
+    }
+    // Never injected
+    return null;
+  }
+
   const handleSessionChange = (_event: unknown, ctx: ExtensionContext): void => {
     resetSession(ctx.cwd);
   };
@@ -209,6 +288,48 @@ export function registerSubdirContextAutoload(pi: ExtensionAPI): void {
   pi.on("session_start", handleSessionChange);
   pi.on("session_switch", handleSessionChange);
   pi.on("session_tree", handleSessionChange);
+
+  // Re-inject AGENTS.md context as a hidden message when it drifts out of the recency window
+  pi.on("before_agent_start", (_event, ctx) => {
+    ensureSession(ctx.cwd);
+    const branchContext = collectBranchContext(ctx);
+    syncRuntimeFromBranch(branchContext);
+
+    if (!branchContext.size) return undefined;
+
+    const recency = getRecencyWindow(pi);
+    const sinceLastInjection = countAssistantMessagesSinceLastInjection(ctx);
+
+    // If we've injected before and it's still within the recency window, skip
+    if (sinceLastInjection !== null && sinceLastInjection < recency) {
+      return undefined;
+    }
+
+    const msg = buildInjectedContextMessage(branchContext);
+    if (!msg) return undefined;
+
+    // Show a refresh notification when re-injecting (not on first injection)
+    if (sinceLastInjection !== null) {
+      const files = [...branchContext.keys()].map((p) => relativePath(p));
+      pi.sendMessage({
+        customType: SUBDIR_CONTEXT_NOTIFY_TYPE,
+        content: files.length === 1
+          ? `Refreshed ${files[0]}`
+          : `Refreshed ${files.length} AGENTS.md files`,
+        display: true,
+        details: { files },
+      });
+    }
+
+    return {
+      message: {
+        customType: msg.customType,
+        content: msg.content,
+        display: false,
+        details: msg.details,
+      },
+    };
+  });
 
   pi.on("tool_result", async (event, ctx) => {
     if (event.isError) return undefined;
@@ -278,12 +399,15 @@ export function registerSubdirContextAutoload(pi: ExtensionAPI): void {
       }
     }
 
-    if (loadedNow.length && ctx.hasUI) {
-      const label =
-        loadedNow.length === 1
-          ? `Loaded AGENTS.md context: ${loadedNow[0]}`
-          : `Loaded AGENTS.md context (${loadedNow.length} files)`;
-      ctx.ui.notify(label, "info");
+    if (loadedNow.length) {
+      pi.sendMessage({
+        customType: SUBDIR_CONTEXT_NOTIFY_TYPE,
+        content: loadedNow.length === 1
+          ? `Loaded ${loadedNow[0]}`
+          : `Loaded ${loadedNow.length} AGENTS.md files`,
+        display: true,
+        details: { files: loadedNow },
+      });
     }
 
     if (!persistedFiles.length) return undefined;
@@ -291,22 +415,4 @@ export function registerSubdirContextAutoload(pi: ExtensionAPI): void {
     return { details };
   });
 
-  pi.on("context", async (event, ctx) => {
-    ensureSession(ctx.cwd);
-    const branchContext = collectBranchContext(ctx);
-    const injected = buildInjectedContextMessage(branchContext);
-    if (!injected) return undefined;
-    const baseMessages = Array.isArray(event.messages) ? event.messages : [];
-    const messages = baseMessages.filter((message) => {
-      return !(
-        message &&
-        typeof message === "object" &&
-        "role" in message &&
-        message.role === "custom" &&
-        "customType" in message &&
-        message.customType === SUBDIR_CONTEXT_MESSAGE_TYPE
-      );
-    });
-    return { messages: [...messages, injected] };
-  });
 }

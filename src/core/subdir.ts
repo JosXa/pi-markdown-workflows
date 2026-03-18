@@ -207,10 +207,22 @@ export function registerSubdirContextAutoload(pi: ExtensionAPI): void {
     return out;
   }
 
-  function syncRuntimeFromBranch(branchContext: Map<string, string>): void {
+  /** Full reset — rebuilds runtime state from branch. Use at turn boundaries. */
+  function resetRuntimeFromBranch(branchContext: Map<string, string>): void {
     loadedAgents.clear();
     loadedAgents.add(cwdAgentsPath);
     loadedAgentsContent.clear();
+    for (const [agentsPath, content] of branchContext.entries()) {
+      loadedAgents.add(agentsPath);
+      loadedAgentsContent.set(agentsPath, content);
+    }
+  }
+
+  /** Merge-only — adds branch context without clearing in-memory state.
+   *  Use within a turn (tool_result) to avoid clobbering additions from
+   *  earlier tool_result handlers whose details haven't persisted yet. */
+  function mergeRuntimeFromBranch(branchContext: Map<string, string>): void {
+    loadedAgents.add(cwdAgentsPath);
     for (const [agentsPath, content] of branchContext.entries()) {
       loadedAgents.add(agentsPath);
       loadedAgentsContent.set(agentsPath, content);
@@ -293,7 +305,7 @@ export function registerSubdirContextAutoload(pi: ExtensionAPI): void {
   pi.on("before_agent_start", (_event, ctx) => {
     ensureSession(ctx.cwd);
     const branchContext = collectBranchContext(ctx);
-    syncRuntimeFromBranch(branchContext);
+    resetRuntimeFromBranch(branchContext);
 
     if (!branchContext.size) return undefined;
 
@@ -344,7 +356,7 @@ export function registerSubdirContextAutoload(pi: ExtensionAPI): void {
 
     ensureSession(ctx.cwd);
     const branchContext = collectBranchContext(ctx);
-    syncRuntimeFromBranch(branchContext);
+    mergeRuntimeFromBranch(branchContext);
 
     readCount += 1;
 

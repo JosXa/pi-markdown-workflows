@@ -65,44 +65,218 @@ function isInsideRoot(rootDir: string, targetPath: string): boolean {
   return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
 }
 
-function isDiscoveryBashCommand(value: string): boolean {
-  const lower = value.trim().toLowerCase();
-  if (!lower) return false;
-  const command = lower.split(/\s+/)[0] ?? "";
+function nearestExistingPath(targetPath: string): string {
+  let current = path.normalize(targetPath);
+  for (;;) {
+    if (fs.existsSync(current)) return current;
+    const parent = path.dirname(current);
+    if (parent === current) return current;
+    current = parent;
+  }
+}
+
+function findRepositoryRoot(targetPath: string): string {
+  const existing = nearestExistingPath(targetPath);
+  let dir = fs.existsSync(existing) && fs.statSync(existing).isDirectory()
+    ? existing
+    : path.dirname(existing);
+
+  for (;;) {
+    if (
+      fs.existsSync(path.join(dir, ".git"))
+      || fs.existsSync(path.join(dir, ".jj"))
+      || fs.existsSync(path.join(dir, ".hg"))
+    ) {
+      return dir;
+    }
+    const parent = path.dirname(dir);
+    if (parent === dir) return "";
+    dir = parent;
+  }
+}
+
+function searchRootForTarget(targetPath: string, cwdRoot: string, homeRoot: string): string {
+  if (isInsideRoot(cwdRoot, targetPath)) return cwdRoot;
+  if (isInsideRoot(homeRoot, targetPath)) return homeRoot;
+
+  const repoRoot = findRepositoryRoot(targetPath);
+  if (repoRoot) return repoRoot;
+
+  const existing = nearestExistingPath(targetPath);
+  const dir = fs.existsSync(existing) && fs.statSync(existing).isDirectory()
+    ? existing
+    : path.dirname(existing);
+  return path.parse(dir).root;
+}
+
+function stripWrappingQuotes(value: string): string {
+  const trimmed = value.trim();
+  if (trimmed.length < 2) return trimmed;
+  const first = trimmed[0];
+  const last = trimmed[trimmed.length - 1];
+  if ((first === '"' && last === '"') || (first === "'" && last === "'")) {
+    return trimmed.slice(1, -1);
+  }
+  return trimmed;
+}
+
+function splitCommandTokens(value: string): string[] {
+  const tokens: string[] = [];
+  let current = "";
+  let quote: '"' | "'" | null = null;
+
+  for (let index = 0; index < value.length; index += 1) {
+    const char = value[index];
+    if (quote) {
+      if (char === quote) {
+        quote = null;
+      } else {
+        current += char;
+      }
+      continue;
+    }
+    if (char === '"' || char === "'") {
+      quote = char;
+      continue;
+    }
+    if (/\s/.test(char)) {
+      if (current) {
+        tokens.push(current);
+        current = "";
+      }
+      continue;
+    }
+    current += char;
+  }
+
+  if (current) tokens.push(current);
+  return tokens;
+}
+
+function splitShellSegments(value: string): string[] {
+  const segments: string[] = [];
+  let current = "";
+  let quote: '"' | "'" | null = null;
+
+  for (let index = 0; index < value.length; index += 1) {
+    const char = value[index];
+    const next = value[index + 1];
+    if (quote) {
+      if (char === quote) quote = null;
+      current += char;
+      continue;
+    }
+    if (char === '"' || char === "'") {
+      quote = char;
+      current += char;
+      continue;
+    }
+    const isDoubleSeparator = (char === "&" && next === "&") || (char === "|" && next === "|");
+    if (char === ";" || char === "|" || isDoubleSeparator) {
+      const segment = current.trim();
+      if (segment) segments.push(segment);
+      current = "";
+      if (isDoubleSeparator) index += 1;
+      continue;
+    }
+    current += char;
+  }
+
+  const tail = current.trim();
+  if (tail) segments.push(tail);
+  return segments;
+}
+
+function unwrapShellCommand(value: string): string {
+  let current = value.trim();
+  for (;;) {
+    const next =
+      current.match(/^(?:nu|bash|sh|zsh)\s+-(?:l?c)\s+([\s\S]+)$/i)?.[1]
+      ?? current.match(/^(?:pwsh|powershell)(?:\.exe)?\s+-(?:c|command)\s+([\s\S]+)$/i)?.[1]
+      ?? current.match(/^cmd(?:\.exe)?\s+\/c\s+([\s\S]+)$/i)?.[1];
+    if (!next) return current;
+    const unwrapped = stripWrappingQuotes(next);
+    if (unwrapped === current) return current;
+    current = unwrapped.trim();
+  }
+}
+
+function isDiscoveryCommandSegment(value: string): boolean {
+  const parts = splitCommandTokens(value.toLowerCase());
+  if (!parts.length) return false;
+  const command = parts[0] ?? "";
   const names = new Set(["ls", "find", "rg", "grep", "fd", "tree", "git"]);
   if (command !== "git") return names.has(command);
-  const parts = lower.split(/\s+/);
   const subcommand = parts[1] ?? "";
   return subcommand === "ls-files" || subcommand === "grep";
 }
 
-function bashTargets(value: string, base: string): string[] {
-  const parts = value
-    .split(/\s+/)
-    .map((item) => item.trim().replace(/^['"]+|['"]+$/g, ""))
-    .filter(Boolean);
+function resolveCdSegment(value: string, base: string): string | null {
+  const parts = splitCommandTokens(value);
+  if (!parts.length || parts[0]?.toLowerCase() !== "cd") return null;
+  let targetIndex = 1;
+  while (parts[targetIndex]?.startsWith("-")) targetIndex += 1;
+  const target = parts[targetIndex];
+  if (!target) return base;
+  if (target === "~") return resolvePath(os.homedir(), base);
+  return resolvePath(target, base);
+}
+
+function segmentTargets(value: string, base: string): string[] {
+  const parts = splitCommandTokens(value);
   if (!parts.length) return [base];
   const paths: string[] = [];
   for (let index = 1; index < parts.length; index += 1) {
     const item = parts[index];
     if (!item) continue;
     if (item.startsWith("-")) continue;
-    if (item === "|" || item === "&&" || item === ";") continue;
     if (item.includes("=")) continue;
     if (item === ".") {
       paths.push(base);
+      continue;
+    }
+    if (item === "~") {
+      paths.push(resolvePath(os.homedir(), base));
       continue;
     }
     if (item.startsWith("/")) {
       paths.push(resolvePath(item, base));
       continue;
     }
-    if (item.startsWith("./") || item.startsWith("../") || item.includes("/")) {
+    if (item.startsWith("./") || item.startsWith("../") || item.includes("/") || item.includes("\\")) {
       paths.push(resolvePath(item, base));
     }
   }
   if (!paths.length) return [base];
   return paths;
+}
+
+function isDiscoveryBashCommand(value: string): boolean {
+  const command = unwrapShellCommand(value);
+  return splitShellSegments(command).some((segment) => isDiscoveryCommandSegment(segment));
+}
+
+function bashTargets(value: string, base: string): string[] {
+  const command = unwrapShellCommand(value);
+  const segments = splitShellSegments(command);
+  let currentBase = base;
+  const paths: string[] = [];
+  let sawDiscovery = false;
+
+  for (const segment of segments) {
+    const changedDir = resolveCdSegment(segment, currentBase);
+    if (changedDir !== null) {
+      currentBase = changedDir;
+      continue;
+    }
+    if (!isDiscoveryCommandSegment(segment)) continue;
+    sawDiscovery = true;
+    paths.push(...segmentTargets(segment, currentBase));
+  }
+
+  if (!sawDiscovery) return [];
+  if (!paths.length) return [currentBase];
+  return [...new Set(paths)];
 }
 
 function parsePersistedContextDetails(details: unknown): PersistedContextDetails | null {
@@ -143,15 +317,7 @@ export function registerSubdirContextAutoload(pi: ExtensionAPI): void {
     default: "10",
   });
 
-  // Renderer for the context injection message (shown inline in conversation)
-  pi.registerMessageRenderer(SUBDIR_CONTEXT_MESSAGE_TYPE, (message, _options, theme) => {
-    const details = message.details as { files?: string[] } | undefined;
-    const files = details?.files ?? [];
-    const lines = files.map((f) => theme.fg("dim", `↳ Loaded ${f}`));
-    return new Text(lines.join("\n"), 0, 0);
-  });
-
-  // Renderer for the re-injection notification
+  // Renderer for visible load/refresh notifications
   pi.registerMessageRenderer(SUBDIR_CONTEXT_NOTIFY_TYPE, (message, _options, theme) => {
     const details = message.details as { files?: string[] } | undefined;
     const files = details?.files ?? [];
@@ -244,7 +410,7 @@ export function registerSubdirContextAutoload(pi: ExtensionAPI): void {
     return agentsFiles.reverse();
   }
 
-  function buildInjectedContextMessage(branchContext: Map<string, string>) {
+  function buildInjectedContextBody(branchContext: Map<string, string>): string | null {
     if (!branchContext.size) return null;
     const files = [...branchContext.entries()].sort(([a], [b]) => a.localeCompare(b));
     const body = files
@@ -253,35 +419,61 @@ export function registerSubdirContextAutoload(pi: ExtensionAPI): void {
         return `<agents_file path="${rel}">\n${content}\n</agents_file>`;
       })
       .join("\n\n");
+    return [
+      "<subdirectory_agents_context>",
+      "Automatically loaded AGENTS.md context relevant to recently accessed files.",
+      body,
+      "</subdirectory_agents_context>",
+    ].join("\n");
+  }
+
+  function payloadContainsInjectedContext(value: unknown): boolean {
+    if (typeof value === "string") return value.includes("<subdirectory_agents_context>");
+    if (Array.isArray(value)) return value.some((item) => payloadContainsInjectedContext(item));
+    if (value && typeof value === "object") {
+      return Object.values(value as Record<string, unknown>).some((item) => payloadContainsInjectedContext(item));
+    }
+    return false;
+  }
+
+  function appendInjectedContextToPayload(payload: unknown, body: string): unknown {
+    if (!payload || typeof payload !== "object" || Array.isArray(payload)) return payload;
+    const record = payload as Record<string, unknown>;
+    const messages = record.messages;
+    if (!Array.isArray(messages) || payloadContainsInjectedContext(messages)) return payload;
+
+    const sampleMessage = messages.find((item) => item && typeof item === "object" && !Array.isArray(item)) as
+      | Record<string, unknown>
+      | undefined;
+    const injectedMessage = Array.isArray(sampleMessage?.content)
+      ? { role: "user", content: [{ type: "text", text: body }] }
+      : { role: "user", content: body };
+
     return {
-      role: "custom" as const,
-      customType: SUBDIR_CONTEXT_MESSAGE_TYPE,
-      content: [
-        "<subdirectory_agents_context>",
-        "Automatically loaded AGENTS.md context relevant to recently accessed files.",
-        body,
-        "</subdirectory_agents_context>",
-      ].join("\n"),
-      display: false,
-      details: {
-        files: files.map(([agentsPath]) => relativePath(agentsPath)),
-      },
-      timestamp: Date.now(),
+      ...record,
+      messages: [...messages, injectedMessage],
     };
   }
 
-  function countAssistantMessagesSinceLastInjection(ctx: ExtensionContext): number | null {
+  function countAssistantMessagesSinceLastSignal(ctx: ExtensionContext): number | null {
     const branch = ctx.sessionManager.getBranch();
     let assistantCount = 0;
     // Walk backwards from the end of the branch
     for (let i = branch.length - 1; i >= 0; i--) {
       const entry = branch[i];
-      if (!entry || typeof entry !== "object" || entry.type !== "message") continue;
+      if (!entry || typeof entry !== "object") continue;
+      if (entry.type === "custom_message") {
+        const customType = (entry as { customType?: unknown }).customType;
+        if (customType === SUBDIR_CONTEXT_NOTIFY_TYPE || customType === SUBDIR_CONTEXT_MESSAGE_TYPE) {
+          return assistantCount;
+        }
+        continue;
+      }
+      if (entry.type !== "message") continue;
       const message = (entry as { message?: unknown }).message;
       if (!message || typeof message !== "object" || Array.isArray(message)) continue;
       const role = (message as { role?: unknown }).role;
       const customType = (message as { customType?: unknown }).customType;
-      // Found our injection message — return the count
       if (role === "custom" && customType === SUBDIR_CONTEXT_MESSAGE_TYPE) {
         return assistantCount;
       }
@@ -289,8 +481,23 @@ export function registerSubdirContextAutoload(pi: ExtensionAPI): void {
         assistantCount++;
       }
     }
-    // Never injected
     return null;
+  }
+
+  function sendContextSignal(kind: "loaded" | "refreshed", files: string[]): void {
+    if (!files.length) return;
+    pi.sendMessage({
+      customType: SUBDIR_CONTEXT_NOTIFY_TYPE,
+      content: kind === "loaded"
+        ? files.length === 1
+          ? `Loaded ${files[0]}`
+          : `Loaded ${files.length} AGENTS.md files`
+        : files.length === 1
+          ? `Refreshed ${files[0]}`
+          : `Refreshed ${files.length} AGENTS.md files`,
+      display: true,
+      details: { files },
+    });
   }
 
   const handleSessionChange = (_event: unknown, ctx: ExtensionContext): void => {
@@ -301,46 +508,33 @@ export function registerSubdirContextAutoload(pi: ExtensionAPI): void {
   pi.on("session_switch", handleSessionChange);
   pi.on("session_tree", handleSessionChange);
 
-  // Re-inject AGENTS.md context as a hidden message when it drifts out of the recency window
+  // Keep runtime state aligned with persisted branch context, but do not signal here.
+  // before_agent_start only runs for user prompts, while provider injection also needs
+  // to refresh during assistant/tool-driven follow-up requests.
   pi.on("before_agent_start", (_event, ctx) => {
     ensureSession(ctx.cwd);
     const branchContext = collectBranchContext(ctx);
     resetRuntimeFromBranch(branchContext);
+    return undefined;
+  });
 
+  pi.on("before_provider_request", (event, ctx) => {
+    ensureSession(ctx.cwd);
+    const branchContext = collectBranchContext(ctx);
     if (!branchContext.size) return undefined;
 
     const recency = getRecencyWindow(pi);
-    const sinceLastInjection = countAssistantMessagesSinceLastInjection(ctx);
-
-    // If we've injected before and it's still within the recency window, skip
-    if (sinceLastInjection !== null && sinceLastInjection < recency) {
-      return undefined;
-    }
-
-    const msg = buildInjectedContextMessage(branchContext);
-    if (!msg) return undefined;
-
-    // Show a refresh notification when re-injecting (not on first injection)
-    if (sinceLastInjection !== null) {
+    const sinceLastSignal = countAssistantMessagesSinceLastSignal(ctx);
+    if (sinceLastSignal === null || sinceLastSignal >= recency) {
       const files = [...branchContext.keys()].map((p) => relativePath(p));
-      pi.sendMessage({
-        customType: SUBDIR_CONTEXT_NOTIFY_TYPE,
-        content: files.length === 1
-          ? `Refreshed ${files[0]}`
-          : `Refreshed ${files.length} AGENTS.md files`,
-        display: true,
-        details: { files },
-      });
+      sendContextSignal(sinceLastSignal === null ? "loaded" : "refreshed", files);
     }
 
-    return {
-      message: {
-        customType: msg.customType,
-        content: msg.content,
-        display: false,
-        details: msg.details,
-      },
-    };
+    const body = buildInjectedContextBody(branchContext);
+    if (!body) return undefined;
+
+    const patched = appendInjectedContextToPayload(event.payload, body);
+    return patched === event.payload ? undefined : patched;
   });
 
   pi.on("tool_result", async (event, ctx) => {
@@ -371,16 +565,8 @@ export function registerSubdirContextAutoload(pi: ExtensionAPI): void {
 
     const paths = new Set<string>();
     for (const target of targets) {
-      const searchRoot = isInsideRoot(currentCwd, target)
-        ? currentCwd
-        : isInsideRoot(homeDir, target)
-          ? homeDir
-          : "";
+      const searchRoot = searchRootForTarget(target, currentCwd, homeDir);
       if (!searchRoot) continue;
-      if (path.basename(target) === "AGENTS.md") {
-        loadedAgents.add(path.normalize(target));
-        continue;
-      }
       const probe =
         fs.existsSync(target) && fs.statSync(target).isDirectory()
           ? path.join(target, "__probe__")
@@ -412,14 +598,7 @@ export function registerSubdirContextAutoload(pi: ExtensionAPI): void {
     }
 
     if (loadedNow.length) {
-      pi.sendMessage({
-        customType: SUBDIR_CONTEXT_NOTIFY_TYPE,
-        content: loadedNow.length === 1
-          ? `Loaded ${loadedNow[0]}`
-          : `Loaded ${loadedNow.length} AGENTS.md files`,
-        display: true,
-        details: { files: loadedNow },
-      });
+      sendContextSignal("loaded", loadedNow);
     }
 
     if (!persistedFiles.length) return undefined;
